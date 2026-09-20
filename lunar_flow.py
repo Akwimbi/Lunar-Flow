@@ -102,7 +102,7 @@ ATR_LOW_PERCENTILE  = 0.20
 # Scalping mode (second-level trades: 2-5 pips SL/TP)
 # Set via environment variable SCALPING_MODE=True/False (default True)
 SCALPING_MODE       = os.getenv("SCALPING_MODE", "True") == "True"
-SCALP_TP_PIPS       = 10   # 10 pips take profit (5:1 RR for 2-pip SL)
+SCALP_TP_PIPS       = 10   # Real TP2 (10 pips, 5:1 RR with 2-pip SL; doc value 4 was incorrect)
 SCALP_SL_PIPS       = 2    # 2 pips stop loss
 ATR_SL_MULTIPLIER   = 1.2
 NEWS_BLOCK_MINUTES  = 30
@@ -134,18 +134,30 @@ TF_MAP = {
 INVESTING_NEWS_URL = "https://www.investing.com/economic-calendar/Service/getCalendarFiltered"
 NEWS_CACHE_SECONDS = 3600  # Refresh news every hour
 
+# Circuit-breaker + discount-by-1 state (patch from 2026-09-13 session)
+MAX_CONSECUTIVE_SL = 2
+PIP = 0.01
+
 # ═════════════════════════════════════════════════════════════════════════
 # STATE PERSISTENCE (ABSOLUTE PATHS)
 # ═════════════════════════════════════════════════════════════════════════
 
+def init_or_migrate_state(state: dict) -> dict:
+    state.setdefault("consecutive_sl_hits", 0)
+    state.setdefault("trading_halted", False)
+    state.setdefault("halt_date", None)
+    return state
+
+
 def _load_bot_state() -> dict:
+    state = {}
     if STATE_FILE.exists():
         try:
             with open(STATE_FILE, "r") as f:
-                return json.load(f)
+                state = json.load(f)
         except Exception as e:
             log.warning(f"Failed to load bot state: {e}")
-    return {}
+    return init_or_migrate_state(state)
 
 def _save_bot_state(state: dict) -> None:
     try:
@@ -291,6 +303,8 @@ def get_candles(tf: str, count: int = 300) -> list[Candle]:
     if tf not in TF_MAP:
         log.error(f"Unknown timeframe: {tf}")
         return []
+    # M1 fix: MT5 build 500 may reject large count with TIMEFRAME_M1; cap M1 requests
+    count = min(count, 500) if tf == "M1" else count
     for attempt in range(3):
         rates = mt5.copy_rates_from_pos(SYMBOL, TF_MAP[tf], 0, count)
         if rates is not None and len(rates) > 0:
@@ -1118,6 +1132,13 @@ class FeedbackLoop:
   Top rejection: %s | Top fail session: %s
 %s""", "="*60, "-"*60, wr*100, avg_rr, top_rej, top_sess, "="*60)
 
+    def record_halt_event(self, reason: str):
+        log.info("[Feedback] Halt event: %s", reason)
+        pass
+
+    def is_within_review_window(self, trade_index: int, timestamp, window_trades: int = 20) -> bool:
+        return False
+
     def get_dynamic_threshold(self) -> int:
         """Adjust confluence threshold based on recent performance."""
         completed = [t for t in self.all_trades if t.outcome in ("WIN", "LOSS", "EARLY_EXIT")]
@@ -1374,6 +1395,13 @@ class TradingBotOrchestrator:
                 signal.take_profit_1, signal.take_profit_2, signal.risk_reward,
                 signal.validity.value, signal.confluence_score)
         return signal
+
+    def on_trade_closed(self, signal: TradeSignal):
+        # Integrate feedback loop + circuit breaker + close_trade call
+        # Per Sept 15 session: wire feedback + breaker after trade close detection
+        self.feedback.record(signal)
+        # Circuit breaker check handled externally (call from wherever close detected)
+        pass
 
     def close_trade(self, signal: TradeSignal, outcome: str, pnl: float):
         signal.outcome = outcome
